@@ -16,6 +16,7 @@
   <div class="topbar-row toolbar">
     <input id="search" type="search" placeholder="Search bookmarks (text, @user)…" autocomplete="off" spellcheck="false">
     <button id="sync-btn" class="btn primary" title="Fetch new bookmarks from X">⟳ Sync</button>
+    <button id="topics-btn" class="btn" title="Find topics in bookmarks matching a domain">◫ Topics</button>
     <details class="menu" id="export-menu">
       <summary class="btn" title="Download exports">⤓ Export</summary>
       <div class="menu-items">
@@ -27,6 +28,32 @@
   </div>
 </header>
 
+<section id="topics-panel" class="topics-panel hidden">
+  <div class="panel-card">
+    <div class="panel-head">
+      <h2>◫ Topic finder</h2>
+      <button id="topics-close" class="btn ghost" title="Close">✕</button>
+    </div>
+    <p class="panel-hint">Enter a domain (e.g. <code>arxiv.org</code>) or a word
+    (e.g. <code>rust</code>) — matching posts are analyzed and their topics
+    (keywords, hashtags, top links, authors) listed here.</p>
+    <div class="panel-input-row">
+      <input id="topics-input" type="search" placeholder="domain or topic…" spellcheck="false" autocomplete="off">
+      <button id="topics-go" class="btn primary">Find topics</button>
+    </div>
+    <label class="scope-toggle">
+      <input type="checkbox" id="topics-scope-x">
+      Search all of X (live) instead of just my bookmarks
+    </label>
+    <div id="topics-scope-note" class="scope-note hidden">
+      Live search queries the X API directly (pay-per-use credits; only recent
+      posts, roughly the last 7 days). Requires a connected account.
+    </div>
+    <div id="topics-result"></div>
+  </div>
+</section>
+
+<div id="filter-row"></div>
 <div id="banner"></div>
 <main id="feed" class="feed"></main>
 <div class="center">

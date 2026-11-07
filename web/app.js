@@ -6,6 +6,7 @@ const state = {
   offset: 0,
   limit: 50,
   q: "",
+  domain: null,
   syncTimer: null,
   status: null,
 };
@@ -175,6 +176,8 @@ function renderBanner(s) {
 async function loadBookmarks(append) {
   const params = new URLSearchParams({ limit: String(state.limit), offset: String(state.offset) });
   if (state.q) params.set("q", state.q);
+  if (state.domain) params.set("domain", state.domain);
+  renderFilterRow();
   let data;
   try {
     data = await api("/api/bookmarks?" + params);
@@ -389,6 +392,127 @@ feed.addEventListener("toggle", async (e) => {
   }
 }, true);
 
+// ---------- topic finder ----------
+
+function toggleTopicsPanel(show) {
+  const panel = $("topics-panel");
+  const visible = show === undefined ? panel.classList.contains("hidden") : show;
+  panel.classList.toggle("hidden", !visible);
+  if (visible) {
+    renderFilterRow();
+    $("topics-input").focus();
+  }
+}
+
+async function findTopics() {
+  const input = $("topics-input").value.trim();
+  const result = $("topics-result");
+  if (!input) {
+    result.innerHTML = `<div class="topics-empty">Enter a domain or topic first.</div>`;
+    return;
+  }
+  const scopeX = $("topics-scope-x").checked;
+  result.innerHTML = scopeX
+    ? `<div class="topics-empty">Searching all of X live… this can take a moment.</div>`
+    : `<div class="topics-empty">Analyzing…</div>`;
+  let report;
+  try {
+    const params = new URLSearchParams({ domain: input, scope: scopeX ? "x" : "local" });
+    report = await api("/api/topics?" + params);
+  } catch (e) {
+    result.innerHTML = `<div class="topics-empty">Failed: ${esc(e.message)}</div>`;
+    return;
+  }
+  renderTopics(report);
+}
+
+function renderTopics(r) {
+  const result = $("topics-result");
+  const scopeBadge = r.scope === "x" ? "live X search" : "local bookmarks";
+  const kindBadge = r.is_domain ? "domain" : "topic";
+  let html = `
+    <div class="topics-summary">
+      <strong>${fmt(r.total_matches)}</strong> post(s) match
+      <code>${esc(r.input)}</code>
+      <span class="chip">${kindBadge}</span>
+      <span class="chip">${scopeBadge}</span>
+    </div>`;
+
+  const groups = [
+    ["keywords", "Keywords", "chips"],
+    ["hashtags", "Hashtags", "chips"],
+    ["links", "Top links", "links"],
+    ["authors", "Authors", "chips"],
+  ];
+  let any = false;
+  for (const [key, title, kind] of groups) {
+    const items = r[key] || [];
+    if (!items.length) continue;
+    any = true;
+    html += `<h3 class="topic-group-title">${title}</h3>`;
+    if (kind === "links") {
+      html += `<ul class="topic-links">` + items.map((it) =>
+        `<li><span class="count">${it.count}×</span>
+         <a href="${esc(it.url || "#")}" target="_blank" rel="noopener">${esc(it.label)}</a></li>`
+      ).join("") + `</ul>`;
+    } else {
+      html += `<div class="topic-chips">` + items.map((it) =>
+        `<button class="topic-chip" data-search="${esc(it.label.replace(/^[@#]/, ""))}" title="Search bookmarks for this">
+           ${esc(it.label)}<span>${it.count}</span></button>`
+      ).join("") + `</div>`;
+    }
+  }
+  if (!any && r.total_matches > 0) {
+    html += `<div class="topics-empty">Matched bookmarks, but no recurring topics found in them.</div>`;
+  }
+  if (r.total_matches === 0) {
+    html = `<div class="topics-empty">${
+      r.scope === "x"
+        ? "No matching posts found in X's recent window."
+        : `No bookmarks match “${esc(r.input)}”.`
+    }</div>`;
+  } else {
+    const enc = encodeURIComponent(r.input);
+    const scopeQ = `&scope=${r.scope}`;
+    html += `
+    <div class="topics-actions">
+      ${r.scope === "local" ? `<button class="btn" id="topics-show">Show matching bookmarks</button>` : ""}
+      <a class="btn" href="/api/topics/export?domain=${enc}${scopeQ}&format=json" download title="Topics + matching posts as JSON">⤓ JSON</a>
+      <a class="btn" href="/api/topics/export?domain=${enc}${scopeQ}&format=csv" download title="Topic list as CSV">⤓ CSV</a>
+      <a class="btn" href="/api/topics/export?domain=${enc}${scopeQ}&format=md" download title="Readable Markdown digest">⤓ MD</a>
+    </div>`;
+  }
+  result.innerHTML = html;
+}
+
+function applyDomainFilter(domain) {
+  state.domain = domain || null;
+  $("search").value = "";
+  state.q = "";
+  reloadBookmarks();
+  toggleTopicsPanel(false);
+  window.scrollTo({ top: 0 });
+}
+
+function renderFilterRow() {
+  const row = $("filter-row");
+  if (!state.domain) {
+    row.innerHTML = "";
+    return;
+  }
+  row.innerHTML = `
+    <div class="filter-chip-wrap">
+      <span class="filter-chip">
+        ◫ domain: <code>${esc(state.domain)}</code>
+        <button class="filter-clear" title="Clear domain filter">✕</button>
+      </span>
+    </div>`;
+  row.querySelector(".filter-clear").addEventListener("click", () => {
+    state.domain = null;
+    reloadBookmarks();
+  });
+}
+
 // ---------- sync ----------
 
 async function doSync() {
@@ -431,6 +555,33 @@ $("search").addEventListener("input", (e) => {
 });
 
 $("sync-btn").addEventListener("click", doSync);
+
+// Topics panel wiring.
+$("topics-btn").addEventListener("click", () => toggleTopicsPanel());
+$("topics-close").addEventListener("click", () => toggleTopicsPanel(false));
+$("topics-go").addEventListener("click", findTopics);
+$("topics-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") findTopics();
+});
+$("topics-scope-x").addEventListener("change", (e) => {
+  $("topics-scope-note").classList.toggle("hidden", !e.target.checked);
+});
+$("topics-result").addEventListener("click", (e) => {
+  const chip = e.target.closest(".topic-chip");
+  if (chip) {
+    // Jump to the feed, searching for that topic.
+    $("search").value = chip.dataset.search;
+    state.q = chip.dataset.search;
+    state.domain = null;
+    toggleTopicsPanel(false);
+    reloadBookmarks();
+    window.scrollTo({ top: 0 });
+    return;
+  }
+  if (e.target.closest("#topics-show")) {
+    applyDomainFilter($("topics-input").value.trim());
+  }
+});
 $("load-more").addEventListener("click", () => {
   state.offset += state.items.length;
   loadBookmarks(true);

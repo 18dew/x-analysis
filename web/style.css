@@ -133,6 +133,200 @@ body {
   margin-top: 4px;
 }
 
+/* ---------- Topic finder panel ---------- */
+
+.topics-panel {
+  max-width: 660px;
+  margin: 16px auto 0;
+  padding: 0 16px;
+  width: 100%;
+}
+
+.panel-card {
+  background: var(--card);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.panel-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.btn.ghost {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 4px 10px;
+}
+
+.panel-hint {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0 0 12px;
+}
+.panel-hint code {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 1px 5px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.panel-input-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.panel-input-row input {
+  flex: 1;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 14px;
+  outline: none;
+}
+.panel-input-row input:focus { border-color: var(--accent); }
+
+.topics-summary {
+  font-size: 14px;
+  margin-bottom: 12px;
+}
+.topics-summary code {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+
+.topic-group-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 14px 0 6px;
+}
+
+.topic-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.topic-chip {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.topic-chip:hover { border-color: var(--accent); color: var(--accent); }
+.topic-chip span {
+  color: var(--muted);
+  margin-left: 6px;
+  font-size: 11px;
+}
+
+.topic-links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.topic-links li {
+  font-size: 13px;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  overflow: hidden;
+}
+.topic-links .count { color: var(--muted); min-width: 30px; text-align: right; }
+.topic-links a {
+  color: var(--text);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topic-links a:hover { color: var(--accent); }
+
+.topics-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.topics-actions .btn { text-decoration: none; font-size: 13px; }
+
+.topics-empty {
+  color: var(--muted);
+  font-size: 13.5px;
+  padding: 6px 0;
+}
+
+.scope-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+.scope-toggle input { accent-color: var(--accent); }
+
+.scope-note {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+/* ---------- Domain filter row ---------- */
+
+#filter-row {
+  max-width: 660px;
+  margin: 0 auto;
+  padding: 0 16px;
+  width: 100%;
+}
+.filter-chip-wrap { margin-top: 14px; }
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 5px 6px 5px 14px;
+}
+.filter-chip code { font-size: 12px; }
+.filter-clear {
+  border: none;
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--muted);
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 12px;
+}
+.filter-clear:hover { color: var(--text); }
+
 /* ---------- Banner / empty ---------- */
 
 #banner { max-width: 660px; margin: 0 auto; padding: 0 16px; width: 100%; }

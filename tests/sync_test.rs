@@ -20,6 +20,8 @@ fn test_config(home: &std::path::Path) -> Config {
         callback_url: "http://localhost:0/callback".into(),
         max_results: 2,
         max_pages: 100,
+        max_search_posts: 300,
+        search_page_size: 100,
         api_base_url: String::new(),
         authorize_url: String::new(),
         token_url: String::new(),
@@ -46,8 +48,10 @@ fn tweet(id: &str, text: &str, author_id: &str) -> Value {
     })
 }
 
-/// Mock of the X bookmarks API: two pages of two posts, with expansions
-/// (author users, quoted post, media) in `includes`.
+/// Mock of the X bookmarks API + live search API: two bookmark pages of two
+/// posts with expansions (author users, quoted post, media) in `includes`,
+/// plus a /2/tweets/search/recent route that simulates a low-tier API
+/// (rejects max_results > 10) and validates search operator syntax.
 fn mock_router() -> Router {
     Router::new()
         .route(
@@ -56,6 +60,65 @@ fn mock_router() -> Router {
                 Json(json!({
                     "data": {"id": "42", "name": "Test User", "username": "testuser"}
                 }))
+            }),
+        )
+        .route(
+            "/2/tweets/search/recent",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                let q = params.get("query").cloned().unwrap_or_default();
+                let valid_query = q.contains("url:\"arxiv.org\"") || q.contains("\"rust\"");
+                if !valid_query || !q.contains("-is:retweet") {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({"detail": format!("bad query operator: {q}")})),
+                    );
+                }
+                let max_results: u32 = params
+                    .get("max_results")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if max_results > 10 {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({"errors": [{"message":
+                            "max_results must be between 10 and 10"}]})),
+                    );
+                }
+                if matches!(
+                    params.get("pagination_token").map(String::as_str),
+                    Some("tok2")
+                ) {
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(json!({
+                            "data": [tweet("200", "third live post about rust from arxiv.org", "7")],
+                            "includes": {},
+                            "meta": {"result_count": 1}
+                        })),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(json!({
+                            "data": [
+                                {
+                                    "id": "300",
+                                    "text": "live post one",
+                                    "author_id": "7",
+                                    "entities": {"urls": [
+                                        {"expanded_url": "https://arxiv.org/abs/1",
+                                         "title": "Live Paper"}
+                                    ]}
+                                },
+                                tweet("301", "live post two about rust and transformers via arxiv.org", "7")
+                            ],
+                            "includes": {"users": [
+                                {"id": "7", "username": "author", "name": "The Author"}
+                            ]},
+                            "meta": {"result_count": 2, "next_token": "tok2"}
+                        })),
+                    )
+                }
             }),
         )
         .route(
@@ -68,13 +131,19 @@ fn mock_router() -> Router {
                 if !page2 {
                     Json(json!({
                         "data": [
-                            tweet("100", "first post", "7"),
+                            tweet("100", "first post about rust", "7"),
                             {
                                 "id": "101",
                                 "text": "look at this",
                                 "author_id": "7",
                                 "referenced_posts": [{"type": "quoted", "id": "55"}],
                                 "attachments": {"media_keys": ["mk1"]},
+                                "entities": {
+                                    "urls": [{
+                                        "expanded_url": "https://arxiv.org/abs/1706.03762",
+                                        "title": "Attention Is All You Need"
+                                    }]
+                                },
                                 "note_post": {"text": "a long post that goes past 280 chars…"}
                             }
                         ],
@@ -139,7 +208,7 @@ async fn sync_paginates_stores_and_exports() {
     assert_eq!(store.count_bookmarks().unwrap(), 3);
 
     // Bookmarks keep API order (position 0 = newest).
-    let (items, total) = store.list_bookmarks(None, 10, 0).unwrap();
+    let (items, total) = store.list_bookmarks(None, None, 10, 0).unwrap();
     assert_eq!(total, 3);
     assert_eq!(items[0].id, "100");
     assert_eq!(items[0].metrics.likes, 3);
@@ -186,6 +255,104 @@ async fn sync_paginates_stores_and_exports() {
         .unwrap();
     assert_eq!(report3.mode, "full");
     assert_eq!(store.count_bookmarks().unwrap(), 3);
+
+    // ---- Topic finder ----
+    // Domain mode: one bookmark links arxiv.org.
+    let result = xanalysis::topics::analyze(&store, "https://arxiv.org/").unwrap();
+    assert_eq!(result.report.input, "https://arxiv.org/");
+    assert_eq!(result.report.needle, "arxiv.org");
+    assert!(result.report.is_domain);
+    assert_eq!(result.report.total_matches, 1);
+    assert!(result
+        .report
+        .links
+        .iter()
+        .any(|l| l.label == "Attention Is All You Need"
+            && l.url.as_deref() == Some("https://arxiv.org/abs/1706.03762")));
+    // Exports contain the report and the matched bookmarks.
+    let json = xanalysis::topics::export_json(&result);
+    assert_eq!(json["total_matches"], 1);
+    assert_eq!(json["bookmarks"][0]["author_username"], "author");
+    let csv = xanalysis::topics::export_csv(&result.report);
+    assert!(csv.starts_with("kind,label,count,url\n"));
+
+    // Word mode: matches text, not substrings.
+    let word = xanalysis::topics::analyze(&store, "first").unwrap();
+    assert!(!word.report.is_domain);
+    assert_eq!(word.report.total_matches, 1);
+    let none = xanalysis::topics::analyze(&store, "firs").unwrap();
+    assert_eq!(none.report.total_matches, 0);
+
+    // Feed-level domain filter.
+    let (feed, feed_total) = store
+        .list_bookmarks(None, Some("arxiv.org"), 10, 0)
+        .unwrap();
+    assert_eq!(feed_total, 1);
+    assert_eq!(feed[0].id, "101");
+}
+
+/// The scope=x topic finder: live search across all of X, including the
+/// automatic page-size fallback for tiers that cap max_results below 100,
+/// pagination, the max-posts cap, and precise filtering.
+#[tokio::test]
+async fn topics_scope_x_searches_all_of_x() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_router()).await.unwrap();
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(tmp.path());
+    cfg.api_base_url = format!("http://{addr}/2");
+
+    let tokens = Arc::new(TokenStore::load(tmp.path().join("tokens.json")));
+    tokens
+        .set(TokenSet {
+            access_token: "fake-token".into(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            scope: None,
+            token_type: None,
+            obtained_at: chrono::Utc::now().timestamp(),
+        })
+        .unwrap();
+    let client = XClient::new(&cfg, tokens);
+
+    // Domain mode: query must be url:"arxiv.org" -is:retweet (enforced by the
+    // mock); page size 100 is rejected → falls back to 10; pages until done.
+    let result = xanalysis::topics::analyze_x(&client, "arxiv.org", 5, 100, &|_| {})
+        .await
+        .unwrap();
+    assert_eq!(result.report.scope, "x");
+    assert!(result.report.is_domain);
+    assert_eq!(result.report.total_matches, 3); // 2 posts + 1 from page 2
+    assert!(result.report.links.iter().any(|l| l.label == "Live Paper"));
+    assert_eq!(result.report.authors[0].label, "@author");
+    // Nothing was written to the real archive.
+    assert!(!cfg.db_path().exists());
+
+    // Word mode with the max-posts cap: stops after the first page, then the
+    // precise word filter keeps only the posts actually containing "rust".
+    let capped = xanalysis::topics::analyze_x(&client, "rust", 2, 100, &|_| {})
+        .await
+        .unwrap();
+    assert!(!capped.report.is_domain);
+    assert_eq!(capped.report.total_matches, 1); // only "301" contains rust
+    assert_eq!(capped.report.needle, "rust");
+
+    // Exports work for live results too.
+    let md = xanalysis::topics::export_md(&result);
+    assert!(md.contains("Source: live X search"));
+
+    // Unauthenticated → NotAuthenticated.
+    let no_tokens = Arc::new(TokenStore::load(tmp.path().join("none.json")));
+    let anon = XClient::new(&cfg, no_tokens);
+    let err = match xanalysis::topics::analyze_x(&anon, "arxiv.org", 5, 100, &|_| {}).await {
+        Err(e) => e,
+        Ok(_) => panic!("expected an error for unauthenticated live search"),
+    };
+    assert!(format!("{err:#}").contains("not authenticated"));
 }
 
 #[tokio::test]

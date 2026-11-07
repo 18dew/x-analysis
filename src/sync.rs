@@ -1,6 +1,6 @@
 use crate::api::XClient;
 use crate::config::Config;
-use crate::models::User;
+use crate::models::{Page, User};
 use crate::store::Store;
 use anyhow::Result;
 use serde::Serialize;
@@ -151,6 +151,68 @@ pub async fn run_sync(
     }
 }
 
+/// What `ingest_page` stored from one API page.
+#[derive(Debug, Default)]
+pub struct Ingested {
+    pub len: usize,
+    /// Rows that already existed in the bookmarks table.
+    pub known: usize,
+    pub ids: Vec<String>,
+}
+
+/// Persist one API page (posts, includes, bookmark positions) into a store.
+/// Used by both the bookmark sync and the live-search topic finder (which
+/// points it at a temporary in-memory store).
+pub fn ingest_page(store: &Store, page: &Page, position: &mut i64, now: &str) -> Result<Ingested> {
+    // Includes first, so tweet rows can resolve their author.
+    for (user, raw) in &page.users {
+        store.upsert_user(user, raw)?;
+    }
+    for (post, raw) in &page.ref_posts {
+        store.upsert_tweet(post, raw)?;
+    }
+
+    let mut known = 0usize;
+    let mut ids = Vec::with_capacity(page.tweets.len());
+    for (tweet, raw) in &page.tweets {
+        store.upsert_tweet(tweet, raw)?;
+
+        if let Some(attachments) = &tweet.attachments {
+            if let Some(keys) = attachments.get("media_keys").and_then(|k| k.as_array()) {
+                for key in keys.iter().filter_map(|k| k.as_str()) {
+                    if let Some((media, mraw)) = page.media.iter().find(|(m, _)| m.media_key == key)
+                    {
+                        store.upsert_media(media, &tweet.id, mraw)?;
+                    }
+                }
+            }
+            if let Some(poll_ids) = attachments.get("poll_ids").and_then(|p| p.as_array()) {
+                for id in poll_ids.iter().filter_map(|i| i.as_str()) {
+                    if let Some(poll) = page
+                        .polls
+                        .iter()
+                        .find(|p| p.get("id").and_then(|i| i.as_str()) == Some(id))
+                    {
+                        store.upsert_poll(poll, &tweet.id)?;
+                    }
+                }
+            }
+        }
+
+        let existed = store.upsert_bookmark(&tweet.id, *position, now)?;
+        if existed {
+            known += 1;
+        }
+        ids.push(tweet.id.clone());
+        *position += 1;
+    }
+    Ok(Ingested {
+        len: page.tweets.len(),
+        known,
+        ids,
+    })
+}
+
 async fn run_sync_inner(
     client: &XClient,
     store: &Store,
@@ -178,51 +240,12 @@ async fn run_sync_inner(
             .await?;
         pages += 1;
 
-        // Persist includes first so tweet rows can resolve their author.
-        for (user, raw) in &page.users {
-            store.upsert_user(user, raw)?;
-        }
-        for (post, raw) in &page.ref_posts {
-            store.upsert_tweet(post, raw)?;
-        }
-
         let now = crate::store::now_rfc3339();
-        let mut known_in_page = 0usize;
-        for (tweet, raw) in &page.tweets {
-            store.upsert_tweet(tweet, raw)?;
-
-            if let Some(attachments) = &tweet.attachments {
-                if let Some(keys) = attachments.get("media_keys").and_then(|k| k.as_array()) {
-                    for key in keys.iter().filter_map(|k| k.as_str()) {
-                        if let Some((media, mraw)) =
-                            page.media.iter().find(|(m, _)| m.media_key == key)
-                        {
-                            store.upsert_media(media, &tweet.id, mraw)?;
-                        }
-                    }
-                }
-                if let Some(ids) = attachments.get("poll_ids").and_then(|p| p.as_array()) {
-                    for id in ids.iter().filter_map(|i| i.as_str()) {
-                        if let Some(poll) = page
-                            .polls
-                            .iter()
-                            .find(|p| p.get("id").and_then(|i| i.as_str()) == Some(id))
-                        {
-                            store.upsert_poll(poll, &tweet.id)?;
-                        }
-                    }
-                }
-            }
-
-            let existed = store.upsert_bookmark(&tweet.id, position, &now)?;
-            if existed {
-                known_in_page += 1;
-            } else {
-                new_count += 1;
-            }
-            seen.insert(tweet.id.clone());
-            position += 1;
-        }
+        let ingested = ingest_page(store, &page, &mut position, &now)?;
+        let page_len = ingested.len;
+        let known_in_page = ingested.known;
+        seen.extend(ingested.ids.iter().cloned());
+        new_count += page_len.saturating_sub(known_in_page) as u64;
 
         for err in &page.errors {
             tracing::warn!(
@@ -233,14 +256,12 @@ async fn run_sync_inner(
 
         handle.page_done(pages, seen.len() as u64, new_count);
         tracing::info!(
-            "page {pages}: {} posts ({} total, {} new)",
-            page.tweets.len(),
-            seen.len(),
-            new_count
+            "page {pages}: {page_len} posts ({} total, {new_count} new)",
+            seen.len()
         );
 
         // Incremental mode: stop after 3 consecutive fully-known pages.
-        if mode == "incremental" && !page.tweets.is_empty() && known_in_page == page.tweets.len() {
+        if mode == "incremental" && page_len > 0 && known_in_page == page_len {
             consecutive_known_pages += 1;
             if consecutive_known_pages >= 3 {
                 tracing::info!("incremental sync caught up; stopping early");

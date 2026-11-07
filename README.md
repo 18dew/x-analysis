@@ -10,6 +10,10 @@ A small Rust service that:
 3. **Serves a local web UI** at `http://localhost:8080` to browse, search, and
    inspect all bookmarked posts — including media, quote-posts, polls, and
    engagement metrics.
+4. **Finds topics by domain**: tell it a domain (e.g. `arxiv.org`) or a word
+   (e.g. `rust`) and it lists the topics living inside the matching posts —
+   keywords, hashtags, top links, authors — exportable as JSON/CSV/Markdown.
+   Search just your bookmarks, or all of X live.
 
 ```
 ┌────────────┐   OAuth 2.0 PKCE   ┌─────────────────────────────┐
@@ -110,7 +114,60 @@ You can also trigger a sync and a login from the web UI (Sync button /
 - Access tokens expire after ~2 hours; refresh tokens are rotated
   automatically.
 
-### Automating it
+### Topic finder (search by domain — bookmarks or all of X)
+
+Open the **◫ Topics** panel in the web UI (or use the CLI) and enter a domain
+or topic. Two scopes are available:
+
+- **local** (default) — analyze your bookmark archive.
+- **x** — live-search **all of X** via `GET /2/tweets/search/recent` and
+  analyze those results. Toggle **“Search all of X (live)”** in the panel,
+  or pass `--scope x` / `scope=x`.
+
+Input handling is the same in both scopes:
+
+- **Domain mode** (`arxiv.org`, `https://arxiv.org/abs/…`, `www.arxiv.org` —
+  anything with a dot) — matches posts whose expanded link URLs point at
+  that host, plus plain-text mentions of it. Live search uses the
+  `url:"arxiv.org" -is:retweet` operator.
+- **Topic mode** (anything else, e.g. `rust` or `machine learning`) — matches
+  whole words in post text, hashtags, mentions, and authors (no substring
+  false positives: `firs` does not match `first`).
+
+From the matching posts it extracts, with counts:
+
+- **Keywords** — frequent words (stopwords and the needle itself excluded)
+- **Hashtags**
+- **Top links** — page titles of bookmarked URLs
+- **Authors** — whose posts match
+
+```bash
+# CLI (great for agents)
+xanalysis topics arxiv.org                     # local bookmarks, table
+xanalysis topics arxiv.org --scope x           # live search across all of X
+xanalysis topics rust --scope x --max-posts 100 --format csv
+xanalysis topics arxiv.org --format md         # digest incl. matching posts
+xanalysis topics arxiv.org --format json > topics-arxiv.json
+```
+
+In the UI: click a topic chip to search the feed for it, **Show matching
+bookmarks** (local scope) to filter the feed by the domain, and **⤓ JSON /
+CSV / MD** to download the list — with the scope you searched.
+
+### Live-search notes & caveats
+
+- Requires a connected account (`xanalysis login`) — it runs under your
+  OAuth token's `tweet.read` scope.
+- Uses the **pay-per-use** X API search endpoint: every search costs API
+  credits under your developer account's plan. Default cap is 300 posts
+  (≈ 3 requests); tune with `--max-posts` or `max_search_posts` in
+  `config.toml`.
+- Recent search only covers roughly the **last 7 days** of posts.
+- Some tiers cap the page size below 100; Xanalysis detects that and
+  automatically falls back to the tier's limit.
+- Live results are analyzed in memory — nothing is written to your archive.
+
+## Automating it
 
 `scripts/sync_bookmarks.sh` is a cron-friendly wrapper:
 
@@ -173,7 +230,12 @@ summarize the themes in my bookmarks."*
 | POST | `/api/sync` | start a background sync (409 if one runs) |
 | POST | `/api/login/start` | begin OAuth; returns `{url}` to open |
 | GET | `/callback` | OAuth redirect target (exchange happens here) |
+| GET | `/api/topics?domain=arxiv.org&scope=local\|x` | topics from matching bookmarks (local) or live X search (x) |
+| GET | `/api/topics/export?domain=…&scope=…&format=json\|csv\|md` | download the topic report |
 | GET | `/api/export?format=jsonl\|md` | download current exports |
+
+`/api/bookmarks` also accepts `domain=` to filter the feed. `scope=x` also
+accepts `max_posts=` (default from config, max 1000).
 
 ## Troubleshooting
 

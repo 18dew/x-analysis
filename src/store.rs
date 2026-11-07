@@ -1,6 +1,6 @@
 use crate::models::{Media, Tweet, User};
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -240,6 +240,16 @@ impl Store {
         })
     }
 
+    /// Ephemeral store used by the live-search topic finder: same schema and
+    /// view-building code, but nothing is written to disk.
+    pub fn open_in_memory() -> Result<Store> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Store {
+            conn: Mutex::new(conn),
+        })
+    }
+
     // ---------- Writes ----------
 
     pub fn upsert_tweet(&self, t: &Tweet, raw: &Value) -> Result<()> {
@@ -430,57 +440,63 @@ impl Store {
 
     // ---------- Reads ----------
 
+    /// List bookmarks with optional text search (`q`) and optional domain
+    /// filter (`domain`, matched broadly against post text, URL entities, and
+    /// attachments — callers wanting precise matching use `find_candidates`
+    /// plus `topics::matches`).
     pub fn list_bookmarks(
         &self,
         q: Option<&str>,
+        domain: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<BookmarkView>, i64)> {
         let conn = self.conn.lock().unwrap();
-        let pattern = q.map(|s| format!("%{}%", escape_like(s)));
 
-        let total = match &pattern {
-            Some(p) => conn.query_row(
-                "SELECT COUNT(*) FROM bookmarks b
-                 JOIN tweets t ON t.id = b.tweet_id
-                 LEFT JOIN users u ON u.id = t.author_id
-                 WHERE b.removed_at IS NULL
-                   AND (t.text LIKE ?1 ESCAPE '\\' OR u.name LIKE ?1 ESCAPE '\\'
-                        OR u.username LIKE ?1 ESCAPE '\\')",
-                params![p],
-                |r| r.get::<_, i64>(0),
-            )?,
-            None => conn.query_row(
-                "SELECT COUNT(*) FROM bookmarks WHERE removed_at IS NULL",
-                [],
-                |r| r.get::<_, i64>(0),
-            )?,
-        };
+        let mut binds: Vec<String> = Vec::new();
+        let mut where_sql = String::from("b.removed_at IS NULL");
 
-        let base = format!(
+        if let Some(q) = q.map(str::trim).filter(|s| !s.is_empty()) {
+            binds.push(format!("%{}%", escape_like(q)));
+            let n = binds.len();
+            where_sql.push_str(&format!(
+                " AND (t.text LIKE ?{n} ESCAPE '\\' OR u.name LIKE ?{n} ESCAPE '\\'
+                     OR u.username LIKE ?{n} ESCAPE '\\')"
+            ));
+        }
+        if let Some(d) = domain.map(str::trim).filter(|s| !s.is_empty()) {
+            binds.push(format!("%{}%", escape_like(&crate::topics::normalize(d))));
+            let n = binds.len();
+            where_sql.push_str(&format!(
+                " AND (t.text LIKE ?{n} ESCAPE '\\' OR t.entities_json LIKE ?{n} ESCAPE '\\'
+                     OR t.attachments_json LIKE ?{n} ESCAPE '\\')"
+            ));
+        }
+
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM bookmarks b
+             JOIN tweets t ON t.id = b.tweet_id
+             LEFT JOIN users u ON u.id = t.author_id
+             WHERE {where_sql}"
+        );
+        let total: i64 =
+            conn.query_row(&count_sql, params_from_iter(binds.iter()), |r| r.get(0))?;
+
+        binds.push(limit.to_string());
+        let limit_n = binds.len();
+        binds.push(offset.to_string());
+        let offset_n = binds.len();
+        let sql = format!(
             "SELECT {TWEET_COLUMNS}, b.position, b.first_seen_at, b.removed_at
              FROM bookmarks b
              JOIN tweets t ON t.id = b.tweet_id
-             LEFT JOIN users u ON u.id = t.author_id"
+             LEFT JOIN users u ON u.id = t.author_id
+             WHERE {where_sql}
+             ORDER BY b.position ASC LIMIT ?{limit_n} OFFSET ?{offset_n}"
         );
-        let sql = match &pattern {
-            Some(_) => format!(
-                "{base} WHERE b.removed_at IS NULL
-                   AND (t.text LIKE ?1 ESCAPE '\\' OR u.name LIKE ?1 ESCAPE '\\'
-                        OR u.username LIKE ?1 ESCAPE '\\')
-                   ORDER BY b.position ASC LIMIT ?2 OFFSET ?3"
-            ),
-            None => format!(
-                "{base} WHERE b.removed_at IS NULL
-                   ORDER BY b.position ASC LIMIT ?1 OFFSET ?2"
-            ),
-        };
 
         let mut stmt = conn.prepare(&sql)?;
-        let mut rows = match &pattern {
-            Some(p) => stmt.query(params![p, limit, offset])?,
-            None => stmt.query(params![limit, offset])?,
-        };
+        let mut rows = stmt.query(params_from_iter(binds.iter()))?;
 
         let mut items = Vec::new();
         while let Some(row) = rows.next()? {
@@ -493,6 +509,37 @@ impl Store {
             }
         }
         Ok((items, total))
+    }
+
+    /// Broad candidate rows for topic analysis: any bookmark whose text,
+    /// entities, or author mentions the needle. The caller applies precise
+    /// matching (`crate::topics::matches`) on the result.
+    pub fn find_candidates(&self, needle: &str, max: i64) -> Result<Vec<BookmarkView>> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("%{}%", escape_like(needle));
+        let sql = format!(
+            "SELECT {TWEET_COLUMNS}, b.position, b.first_seen_at, b.removed_at
+             FROM bookmarks b
+             JOIN tweets t ON t.id = b.tweet_id
+             LEFT JOIN users u ON u.id = t.author_id
+             WHERE b.removed_at IS NULL
+               AND (t.text LIKE ?1 ESCAPE '\\' OR t.entities_json LIKE ?1 ESCAPE '\\'
+                    OR u.username LIKE ?1 ESCAPE '\\' OR u.name LIKE ?1 ESCAPE '\\')
+             ORDER BY b.position ASC LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![pattern, max])?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut data = row_data(row)?;
+            data.position = row.get(16)?;
+            data.first_seen_at = row.get(17)?;
+            data.removed_at = row.get(18)?;
+            if let Some(view) = view_from(&conn, data, 0)? {
+                items.push(view);
+            }
+        }
+        Ok(items)
     }
 
     /// Single bookmark/tweet view plus its raw API JSON (for the detail view).
@@ -828,7 +875,7 @@ mod tests {
             .upsert_bookmark("1", 0, "2026-01-01T00:00:00Z")
             .unwrap();
 
-        let (items, total) = store.list_bookmarks(None, 10, 0).unwrap();
+        let (items, total) = store.list_bookmarks(None, None, 10, 0).unwrap();
         assert_eq!(total, 1);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "hello world");
@@ -839,13 +886,18 @@ mod tests {
         assert_eq!(items[0].url, "https://x.com/alice/status/1");
 
         // Search matches text and username.
-        let (hits, t1) = store.list_bookmarks(Some("hello"), 10, 0).unwrap();
+        let (hits, t1) = store.list_bookmarks(Some("hello"), None, 10, 0).unwrap();
         assert_eq!(t1, 1);
         assert_eq!(hits.len(), 1);
-        let (_, t2) = store.list_bookmarks(Some("alice"), 10, 0).unwrap();
+        let (_, t2) = store.list_bookmarks(Some("alice"), None, 10, 0).unwrap();
         assert_eq!(t2, 1);
-        let (_, t3) = store.list_bookmarks(Some("nothing"), 10, 0).unwrap();
+        let (_, t3) = store.list_bookmarks(Some("nothing"), None, 10, 0).unwrap();
         assert_eq!(t3, 0);
+        // Domain filter: none of these rows mention a URL domain.
+        let (_, t4) = store
+            .list_bookmarks(None, Some("arxiv.org"), 10, 0)
+            .unwrap();
+        assert_eq!(t4, 0);
 
         // Detail includes raw JSON.
         let (view, raw_out) = store.get_view("1").unwrap().unwrap();
@@ -895,7 +947,7 @@ mod tests {
 
         store.upsert_bookmark("1", 0, "t").unwrap();
 
-        let (items, _) = store.list_bookmarks(None, 10, 0).unwrap();
+        let (items, _) = store.list_bookmarks(None, None, 10, 0).unwrap();
         let it = &items[0];
         assert_eq!(it.media.len(), 1);
         assert_eq!(it.media[0].kind, "photo");
@@ -909,5 +961,37 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["quoted"]["text"], "quoted text");
         assert_eq!(parsed["media"][0]["type"], "photo");
+    }
+
+    #[test]
+    fn finds_candidates_and_domain_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("test.db")).unwrap();
+
+        let linked = json!({
+            "id": "1", "text": "great paper",
+            "entities": {"urls": [{"expanded_url": "https://arxiv.org/abs/1706.03762"}]}
+        });
+        let tweet: Tweet = serde_json::from_value(linked.clone()).unwrap();
+        store.upsert_tweet(&tweet, &linked).unwrap();
+        store.upsert_bookmark("1", 0, "t").unwrap();
+
+        let other = json!({"id": "2", "text": "cooking thread"});
+        let tweet2: Tweet = serde_json::from_value(other.clone()).unwrap();
+        store.upsert_tweet(&tweet2, &other).unwrap();
+        store.upsert_bookmark("2", 1, "t").unwrap();
+
+        // Broad candidate fetch by domain needle finds only the linked one.
+        let candidates = store.find_candidates("arxiv.org", 100).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "1");
+        assert!(crate::topics::matches(&candidates[0], "arxiv.org"));
+
+        // Feed-level domain filter agrees.
+        let (items, total) = store
+            .list_bookmarks(None, Some("arxiv.org"), 10, 0)
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, "1");
     }
 }

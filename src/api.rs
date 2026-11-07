@@ -126,8 +126,7 @@ impl XClient {
     /// GET /2/users/{id}/bookmarks — one page.
     ///
     /// Handles 429 rate limits by sleeping until the window resets, and 401s
-    /// by refreshing tokens once. `notify` receives human-readable progress
-    /// messages (e.g. rate-limit waits) for surfacing in the UI/CLI.
+    /// by refreshing tokens once.
     pub async fn get_bookmarks_page(
         &self,
         user_id: &str,
@@ -136,32 +135,62 @@ impl XClient {
         notify: &(dyn Fn(String) + Send + Sync),
     ) -> Result<Page> {
         let url = format!("{}/users/{}/bookmarks", self.api_base, user_id);
+        let query = self.standard_query(max_results);
+        self.get_paged(url, query, pagination_token, notify).await
+    }
+
+    /// GET /2/tweets/search/recent — one page of live search results from
+    /// across all of X (recent window, roughly the last 7 days).
+    pub async fn search_recent(
+        &self,
+        query_str: &str,
+        max_results: u32,
+        pagination_token: Option<String>,
+        notify: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<Page> {
+        let url = format!("{}/tweets/search/recent", self.api_base);
+        let mut query = self.standard_query(max_results);
+        query.insert(0, ("query", query_str.to_string()));
+        self.get_paged(url, query, pagination_token, notify).await
+    }
+
+    fn standard_query(&self, max_results: u32) -> Vec<(&'static str, String)> {
+        vec![
+            ("max_results", max_results.to_string()),
+            ("expansions", self.expansions.clone()),
+            ("post.fields", self.post_fields.clone()),
+            (
+                "user.fields",
+                crate::config::DEFAULT_USER_FIELDS.to_string(),
+            ),
+            (
+                "media.fields",
+                crate::config::DEFAULT_MEDIA_FIELDS.to_string(),
+            ),
+            (
+                "poll.fields",
+                crate::config::DEFAULT_POLL_FIELDS.to_string(),
+            ),
+        ]
+    }
+
+    /// Shared core for paged GET endpoints (bookmarks, live search):
+    /// bearer token, 429 wait-and-retry, 401 refresh-once, page parsing.
+    async fn get_paged(
+        &self,
+        url: String,
+        mut query: Vec<(&'static str, String)>,
+        pagination_token: Option<String>,
+        notify: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<Page> {
+        if let Some(t) = pagination_token {
+            query.push(("pagination_token", t));
+        }
         let mut refreshed = false;
         let mut rate_limit_waits = 0u32;
 
         loop {
             let token = self.access_token().await?;
-            let mut query: Vec<(&str, String)> = vec![
-                ("max_results", max_results.to_string()),
-                ("expansions", self.expansions.clone()),
-                ("post.fields", self.post_fields.clone()),
-                (
-                    "user.fields",
-                    crate::config::DEFAULT_USER_FIELDS.to_string(),
-                ),
-                (
-                    "media.fields",
-                    crate::config::DEFAULT_MEDIA_FIELDS.to_string(),
-                ),
-                (
-                    "poll.fields",
-                    crate::config::DEFAULT_POLL_FIELDS.to_string(),
-                ),
-            ];
-            if let Some(t) = &pagination_token {
-                query.push(("pagination_token", t.clone()));
-            }
-
             let resp = self
                 .http
                 .get(&url)
@@ -182,7 +211,7 @@ impl XClient {
                 let wait = (reset - chrono::Utc::now().timestamp() + 2).max(5) as u64;
                 rate_limit_waits += 1;
                 if rate_limit_waits > 12 {
-                    bail!("rate limited too many times in a row; aborting sync");
+                    bail!("rate limited too many times in a row; aborting");
                 }
                 notify(format!(
                     "rate limited; waiting {wait}s for the window to reset…"
@@ -237,15 +266,21 @@ fn brief_error(body: &str) -> String {
         Ok(v) => {
             let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
             let detail = v.get("detail").and_then(|x| x.as_str()).unwrap_or("");
+            let legacy = v
+                .get("errors")
+                .and_then(|x| x.as_array())
+                .and_then(|a| a.first())
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
             let mut s = String::new();
-            if !title.is_empty() {
-                s.push_str(title);
-            }
-            if !detail.is_empty() {
-                if !s.is_empty() {
-                    s.push_str(": ");
+            for part in [title, detail, legacy] {
+                if !part.is_empty() {
+                    if !s.is_empty() {
+                        s.push_str(": ");
+                    }
+                    s.push_str(part);
                 }
-                s.push_str(detail);
             }
             if s.is_empty() {
                 s.push_str(&body.chars().take(300).collect::<String>());

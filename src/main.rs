@@ -53,6 +53,21 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Find topics matching a domain (e.g. arxiv.org) or word
+    Topics {
+        /// Domain (e.g. arxiv.org) or topic word (e.g. rust) to analyze
+        input: String,
+        /// Where to search: local bookmarks (local) or all of X via live
+        /// search (x)
+        #[arg(long, default_value = "local")]
+        scope: String,
+        /// For --scope x: max posts to fetch (default from config, 300)
+        #[arg(long)]
+        max_posts: Option<u64>,
+        /// Output format: table, json, csv, or md
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
 }
 
 #[tokio::main]
@@ -75,6 +90,12 @@ async fn main() -> Result<()> {
         Command::Serve { no_open } => server::serve(cfg, !no_open).await,
         Command::Status => status_cmd(cfg).await,
         Command::Export { format, out } => export_cmd(cfg, &format, out),
+        Command::Topics {
+            input,
+            scope,
+            max_posts,
+            format,
+        } => topics_cmd(cfg, &input, &scope, max_posts, &format).await,
     }
 }
 
@@ -293,6 +314,94 @@ async fn status_cmd(cfg: Config) -> Result<()> {
         None => println!("auth:     not logged in (run `xanalysis login`)"),
     }
     Ok(())
+}
+
+async fn topics_cmd(
+    cfg: Config,
+    input: &str,
+    scope: &str,
+    max_posts: Option<u64>,
+    format: &str,
+) -> Result<()> {
+    let result = match scope {
+        "x" => {
+            let tokens = Arc::new(TokenStore::load(cfg.tokens_path()));
+            if tokens.get().is_none() {
+                bail!("not logged in — `xanalysis login` is required for --scope x");
+            }
+            let client = XClient::new(&cfg, tokens);
+            let max = max_posts.unwrap_or(cfg.max_search_posts);
+            let progress: &(dyn Fn(String) + Send + Sync) = &|msg: String| eprintln!("  {msg}");
+            eprintln!("Searching all of X (recent posts, ~last 7 days) for {input:?}…");
+            xanalysis::topics::analyze_x(&client, input, max, cfg.search_page_size, progress)
+                .await?
+        }
+        "local" => {
+            let store = Store::open(&cfg.db_path())?;
+            xanalysis::topics::analyze(&store, input)?
+        }
+        other => bail!("unknown scope {other:?} (use local or x)"),
+    };
+    let report = &result.report;
+    match format {
+        "json" => println!(
+            "{}",
+            serde_json::to_string_pretty(&xanalysis::topics::export_json(&result))?
+        ),
+        "csv" => print!("{}", xanalysis::topics::export_csv(report)),
+        "md" | "markdown" => print!("{}", xanalysis::topics::export_md(&result)),
+        "table" => print_topics_table(report),
+        other => bail!("unknown format {other:?} (use table, json, csv, or md)"),
+    }
+    Ok(())
+}
+
+fn print_topics_table(report: &xanalysis::topics::TopicsReport) {
+    let source = if report.scope == "x" {
+        "live X search"
+    } else {
+        "local bookmarks"
+    };
+    println!(
+        "Topics for \"{}\" [{source}] — {} matching post(s)",
+        report.input, report.total_matches
+    );
+    if report.total_matches == 0 {
+        if report.scope == "x" {
+            println!("\nNo matching posts found in the recent window.");
+        } else {
+            println!("\nNo matching bookmarks. (Run `xanalysis sync` first.)");
+        }
+        return;
+    }
+    let list = |items: &[xanalysis::topics::TopicItem], n: usize| {
+        items
+            .iter()
+            .take(n)
+            .map(|i| format!("{} ({})", i.label, i.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !report.keywords.is_empty() {
+        println!("\nKeywords: {}", list(&report.keywords, 15));
+    }
+    if !report.hashtags.is_empty() {
+        println!("Hashtags: {}", list(&report.hashtags, 15));
+    }
+    if !report.links.is_empty() {
+        println!("\nTop links:");
+        for l in report.links.iter().take(10) {
+            println!(
+                "  {:>3}× {} — {}",
+                l.count,
+                l.label,
+                l.url.as_deref().unwrap_or("")
+            );
+        }
+    }
+    if !report.authors.is_empty() {
+        println!("\nAuthors: {}", list(&report.authors, 15));
+    }
 }
 
 fn export_cmd(cfg: Config, format: &str, out: Option<PathBuf>) -> Result<()> {

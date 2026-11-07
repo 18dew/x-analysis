@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::models::{CallbackQuery, User};
 use crate::store::Store;
 use crate::sync::{run_sync, SyncHandle};
+use crate::topics;
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -79,6 +80,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/status", get(api_status))
         .route("/api/bookmarks", get(api_bookmarks))
         .route("/api/bookmarks/{id}", get(api_bookmark_detail))
+        .route("/api/topics", get(api_topics))
+        .route("/api/topics/export", get(api_topics_export))
         .route("/api/sync", post(api_sync))
         .route("/api/login/start", post(api_login_start))
         .route("/callback", get(api_callback))
@@ -132,6 +135,7 @@ async fn api_status(State(st): State<Arc<AppState>>) -> Result<Json<serde_json::
 #[derive(Deserialize)]
 struct ListParams {
     q: Option<String>,
+    domain: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -144,6 +148,10 @@ async fn api_bookmarks(
     let offset = p.offset.unwrap_or(0).max(0);
     let (items, total) = st.store.list_bookmarks(
         p.q.as_deref().map(|q| q.trim()).filter(|q| !q.is_empty()),
+        p.domain
+            .as_deref()
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty()),
         limit,
         offset,
     )?;
@@ -165,6 +173,136 @@ async fn api_bookmark_detail(
         ));
     };
     Ok(Json(json!({"item": view, "raw": raw})))
+}
+
+#[derive(Deserialize)]
+struct TopicsParams {
+    domain: Option<String>,
+    /// local (bookmarks archive, default) or x (live search across all of X)
+    scope: Option<String>,
+    /// For scope=x: max posts to fetch.
+    max_posts: Option<u64>,
+}
+
+fn required_input(raw: Option<&str>) -> Result<String, Box<Response>> {
+    let Some(input) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "provide a domain (e.g. ?domain=arxiv.org) or a topic word (e.g. ?domain=rust)"
+                })),
+            )
+                .into_response(),
+        ));
+    };
+    Ok(input.to_string())
+}
+
+fn topics_error_response(e: anyhow::Error) -> Response {
+    if e.downcast_ref::<NotAuthenticated>().is_some() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": format!("{e:#}")})),
+        )
+            .into_response();
+    }
+    tracing::error!("topic analysis failed: {e:#}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": format!("{e:#}")})),
+    )
+        .into_response()
+}
+
+async fn run_topics_analysis(
+    st: &Arc<AppState>,
+    input: &str,
+    scope: &str,
+    max_posts: Option<u64>,
+) -> anyhow::Result<topics::TopicsResult> {
+    match scope {
+        "x" => {
+            let max = max_posts.unwrap_or(st.cfg.max_search_posts).min(1000);
+            let progress: &(dyn Fn(String) + Send + Sync) = &|msg: String| tracing::info!("{msg}");
+            topics::analyze_x(&st.client, input, max, st.cfg.search_page_size, progress).await
+        }
+        "local" => topics::analyze(&st.store, input),
+        other => Err(anyhow::anyhow!("unknown scope {other:?} (use local or x)")),
+    }
+}
+
+/// GET /api/topics?domain=<…>&scope=local|x
+async fn api_topics(
+    State(st): State<Arc<AppState>>,
+    Query(p): Query<TopicsParams>,
+) -> Result<Json<serde_json::Value>, Response> {
+    let input = required_input(p.domain.as_deref()).map_err(|r| *r)?;
+    let scope = p.scope.as_deref().unwrap_or("local");
+    let result = run_topics_analysis(&st, &input, scope, p.max_posts)
+        .await
+        .map_err(topics_error_response)?;
+    Ok(Json(serde_json::to_value(&result.report).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response()
+    })?))
+}
+
+#[derive(Deserialize)]
+struct TopicsExportParams {
+    domain: Option<String>,
+    format: Option<String>,
+    scope: Option<String>,
+    max_posts: Option<u64>,
+}
+
+/// GET /api/topics/export?domain=<…>&format=json|csv|md
+async fn api_topics_export(
+    State(st): State<Arc<AppState>>,
+    Query(p): Query<TopicsExportParams>,
+) -> Result<Response, Response> {
+    let input = required_input(p.domain.as_deref()).map_err(|r| *r)?;
+    let scope = p.scope.as_deref().unwrap_or("local");
+    let result = run_topics_analysis(&st, &input, scope, p.max_posts)
+        .await
+        .map_err(topics_error_response)?;
+    let (body, content_type, filename): (String, &'static str, String) =
+        match p.format.as_deref().unwrap_or("json") {
+            "csv" => (
+                topics::export_csv(&result.report),
+                "text/csv; charset=utf-8",
+                format!("topics-{}.csv", topics::normalize(&input).replace('.', "_")),
+            ),
+            "md" | "markdown" => (
+                topics::export_md(&result),
+                "text/markdown; charset=utf-8",
+                format!("topics-{}.md", topics::normalize(&input).replace('.', "_")),
+            ),
+            _ => (
+                serde_json::to_string_pretty(&topics::export_json(&result)).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                        .into_response()
+                })?,
+                "application/json",
+                format!(
+                    "topics-{}.json",
+                    topics::normalize(&input).replace('.', "_")
+                ),
+            ),
+        };
+    let mut resp = Response::new(axum::body::Body::from(body));
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    if let Ok(cd) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, cd);
+    }
+    Ok(resp)
 }
 
 async fn api_sync(State(st): State<Arc<AppState>>) -> Response {

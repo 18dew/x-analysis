@@ -14,6 +14,8 @@ pub struct FileConfig {
     pub callback_url: Option<String>,
     pub max_results: Option<u32>,
     pub max_pages: Option<u32>,
+    pub max_search_posts: Option<u64>,
+    pub search_page_size: Option<u32>,
     pub api_base_url: Option<String>,
     pub authorize_url: Option<String>,
     pub token_url: Option<String>,
@@ -32,6 +34,11 @@ pub struct Config {
     pub callback_url: String,
     pub max_results: u32,
     pub max_pages: u32,
+    /// Topic-finder live search: how many posts to fetch from X at most.
+    pub max_search_posts: u64,
+    /// Topic-finder live search: page size requested per search call
+    /// (X allows 10-100; some tiers cap it lower — fallback is automatic).
+    pub search_page_size: u32,
     pub api_base_url: String,
     pub authorize_url: String,
     pub token_url: String,
@@ -96,6 +103,8 @@ impl Config {
             callback_url,
             max_results: file.max_results.unwrap_or(100).clamp(1, 100),
             max_pages: file.max_pages.unwrap_or(1000),
+            max_search_posts: file.max_search_posts.unwrap_or(300).min(1000),
+            search_page_size: file.search_page_size.unwrap_or(100).clamp(10, 100),
             api_base_url: non_empty(file.api_base_url)
                 .unwrap_or_else(|| "https://api.x.com/2".to_string()),
             authorize_url: non_empty(file.authorize_url)
@@ -168,6 +177,13 @@ client_secret = ""
 
 # Safety cap on pages fetched per sync (each page is up to 100 bookmarks).
 # max_pages = 1000
+
+# Topic finder — live search across all of X (scope=x):
+# how many posts to fetch at most, and the page size per request.
+# Live search uses the pay-per-use X API and only covers recent posts
+# (roughly the last 7 days).
+# max_search_posts = 300
+# search_page_size = 100
 
 # API endpoints. Override only if X changes them.
 # api_base_url = "https://api.x.com/2"
