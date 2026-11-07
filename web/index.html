@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>X Bookmarks — Xanalysis</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔖</text></svg>">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <div class="brand">🔖 X Bookmarks <span class="brand-sub">Xanalysis</span></div>
+    <div class="status" id="status"></div>
+  </div>
+  <div class="topbar-row toolbar">
+    <input id="search" type="search" placeholder="Search bookmarks (text, @user)…" autocomplete="off" spellcheck="false">
+    <button id="sync-btn" class="btn primary" title="Fetch new bookmarks from X">⟳ Sync</button>
+    <details class="menu" id="export-menu">
+      <summary class="btn" title="Download exports">⤓ Export</summary>
+      <div class="menu-items">
+        <a href="/api/export?format=jsonl" download>bookmarks.jsonl — for agents</a>
+        <a href="/api/export?format=md" download>bookmarks.md — readable digest</a>
+        <div class="menu-hint" id="export-paths"></div>
+      </div>
+    </details>
+  </div>
+</header>
+
+<div id="banner"></div>
+<main id="feed" class="feed"></main>
+<div class="center">
+  <button id="load-more" class="btn hidden">Load more</button>
+</div>
+<div id="empty" class="empty hidden"></div>
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
